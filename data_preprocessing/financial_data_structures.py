@@ -389,3 +389,84 @@ def get_dollar_run_bars(
         expected_window=expected_window,
     )
     return _build_ohlcv_bars(prepared, indices, price_col=price_col, volume_col=volume_col)
+
+
+def get_etf_trick_series(
+        prices: pd.DataFrame,
+        weights: pd.DataFrame,
+        *,
+        initial_value: float = 1.0,
+) -> pd.Series:
+    common_columns = prices.columns.intersection(weights.columns)
+    if len(common_columns) == 0:
+        raise ValueError("Prices and weights must share at least one asset column.")
+    if initial_value <= 0:
+        raise ValueError("Initial value must be positive.")
+
+    aligned_prices = prices.loc[:, common_columns].astype(float).sort_index()
+    aligned_weights = weights.loc[:, common_columns].astype(float).reindex(aligned_prices.index).ffill().fillna(0.0)
+
+    returns = aligned_prices.pct_change().fillna(0.0)
+    lagged_weights = aligned_weights.shift(1).fillna(0.0)
+    portfolio_returns = (lagged_weights * returns).sum(axis=1)
+
+    nav = initial_value * (1.0 + portfolio_returns).cumprod()
+    nav.name = "etf_trick"
+    return nav
+
+
+def get_pca_weights(
+        cov: pd.DataFrame | np.ndarray,
+        risk_dist: np.ndarray | pd.Series | None = None,
+        risk_target: float = 1.0,
+) -> pd.Series | np.ndarray:
+    cov_values = cov.to_numpy(dtype=float) if isinstance(cov, pd.DataFrame) else np.asarray(cov, dtype=float)
+    if cov_values.ndim != 2 or cov_values.shape[0] != cov_values.shape[1]:
+        raise ValueError("Covariance matrix must be square.")
+    if risk_target <= 0:
+        raise ValueError("Risk target must be positive.")
+
+    eigenvalues, eigenvectors = np.linalg.eigh(cov_values)
+    indices = eigenvalues.argsort()[::-1]
+    eigenvalues = eigenvalues[indices]
+    eigenvectors = eigenvectors[:, indices]
+
+    if np.any(eigenvalues <= 0):
+        raise ValueError("Covariance matrix must be positive definite.")
+
+    if risk_dist is None:
+        risk_dist_values = np.zeros(cov_values.shape[0], dtype=float)
+        risk_dist_values[-1] = 1.0
+    else:
+        risk_dist_values = np.asarray(risk_dist, dtype=float).reshape(-1)
+        if risk_dist_values.shape[0] != cov_values.shape[0]:
+            raise ValueError("Risk distribution must match covariance dimensions.")
+
+    loads = risk_target * np.sqrt(risk_dist_values / eigenvalues)
+    weights = eigenvectors @ loads
+
+    if isinstance(cov, pd.DataFrame):
+        return pd.Series(weights, index=cov.index, name="pca_weight")
+    return weights
+
+
+def get_cusum_events(g_raw: pd.Series, threshold: float) -> pd.DatetimeIndex:
+    if threshold <= 0:
+        raise ValueError("Threshold must be positive.")
+
+    t_events: list[pd.Timestamp] = []
+    s_pos = 0.0
+    s_neg = 0.0
+    diff = g_raw.astype(float).diff().dropna()
+
+    for timestamp, value in diff.items():
+        s_pos = max(0.0, s_pos + value)
+        s_neg = min(0.0, s_neg + value)
+        if s_neg < -threshold:
+            s_neg = 0.0
+            t_events.append(timestamp)
+        elif s_pos > threshold:
+            s_pos = 0.0
+            t_events.append(timestamp)
+
+    return pd.DatetimeIndex(t_events)
